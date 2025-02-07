@@ -23,3 +23,20 @@ def extract_columns(sql):
 for sql in sql_queries:
     print("\nSQL:", sql)
     print("Columns:", extract_columns(sql))
+
+# Test cases
+sql_queries = [
+    "SELECT data_id, name FROM table",
+    "SELECT id, my_data_id, name FROM table",
+    "SELECT user_data_id, data_id_temp FROM table",
+    "SELECT id, name, data_id as identifier FROM table",
+    "SELECT COUNT(data_id) FROM table",
+    "SELECT name FROM table"
+]
+
+pattern = r'(?i)SELECT\s+(?:(?!\bFROM\b).)*\b(data_id)\b(?:(?!\bFROM\b).)*\s+FROM'
+
+for sql in sql_queries:
+    match = re.search(pattern, sql)
+    print(f"\nSQL: {sql}")
+    print(f"Contains 'data_id'?: {bool(match)}")
