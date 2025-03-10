@@ -3,7 +3,9 @@ package main
 import (
     "context"
     "crypto/tls"
+    "crypto/x509"
     "encoding/json"
+    "fmt"
     "log"
     "net/http"
     "os"
@@ -12,24 +14,30 @@ import (
     "sync"
     "time"
 
-    "github.com/Shopify/sarama"
+    "github.com/confluentinc/confluent-kafka-go/v2/kafka"
     "github.com/elastic/go-elasticsearch/v8"
     "github.com/elastic/go-elasticsearch/v8/esutil"
 )
 
 type Config struct {
-    KafkaBrokers      []string
-    KafkaTopics       []string
+    KafkaConfig        KafkaConfig
     ElasticsearchConfig ElasticsearchConfig
-    BatchSize         int
-    BatchTimeout      time.Duration
+    BatchSize          int
+    BatchTimeout       time.Duration
+}
+
+type KafkaConfig struct {
+    BootstrapServers string
+    Topics           []string
+    GroupID          string
+    AutoOffsetReset  string
 }
 
 type ElasticsearchConfig struct {
-    Addresses    []string
-    Username     string
-    Password     string
-    CACert       string // Path to CA certificate
+    Addresses     []string
+    Username      string
+    Password      string
+    CACert        string
     SkipTLSVerify bool
     EnableRetry   bool
     MaxRetries    int
@@ -43,22 +51,20 @@ type Message struct {
 }
 
 type Consumer struct {
-    ready    chan bool
     messages chan *Message
     config   *Config
     es       *elasticsearch.Client
     bi       esutil.BulkIndexer
+    consumer *kafka.Consumer
 }
 
 func newElasticsearchClient(config ElasticsearchConfig) (*elasticsearch.Client, error) {
-    // Create transport with TLS configuration
     transport := http.Transport{
         TLSClientConfig: &tls.Config{
             InsecureSkipVerify: config.SkipTLSVerify,
         },
     }
 
-    // If CA certificate is provided, load it
     if config.CACert != "" {
         cert, err := os.ReadFile(config.CACert)
         if err != nil {
@@ -76,11 +82,11 @@ func newElasticsearchClient(config ElasticsearchConfig) (*elasticsearch.Client, 
     }
 
     cfg := elasticsearch.Config{
-        Addresses: config.Addresses,
-        Username:  config.Username,
-        Password:  config.Password,
-        Transport: &transport,
-        RetryOnStatus: []int{502, 503, 504, 429}, // Retry on service unavailable and too many requests
+        Addresses:     config.Addresses,
+        Username:      config.Username,
+        Password:      config.Password,
+        Transport:     &transport,
+        RetryOnStatus: []int{502, 503, 504, 429},
         MaxRetries:    config.MaxRetries,
         RetryBackoff:  retryBackoff,
         EnableRetryOnTimeout: config.EnableRetry,
@@ -97,7 +103,7 @@ func newConsumer(config *Config) (*Consumer, error) {
         return nil, fmt.Errorf("error creating elasticsearch client: %v", err)
     }
 
-    // Test the connection
+    // Test Elasticsearch connection
     res, err := es.Info()
     if err != nil {
         return nil, fmt.Errorf("error connecting to elasticsearch: %v", err)
@@ -108,13 +114,23 @@ func newConsumer(config *Config) (*Consumer, error) {
         return nil, fmt.Errorf("error getting elasticsearch info: %s", res.String())
     }
 
+    // Initialize Kafka consumer with plain configuration
+    kc, err := kafka.NewConsumer(&kafka.ConfigMap{
+        "bootstrap.servers":  config.KafkaConfig.BootstrapServers,
+        "group.id":          config.KafkaConfig.GroupID,
+        "auto.offset.reset": config.KafkaConfig.AutoOffsetReset,
+        "security.protocol": "plaintext",
+    })
+    if err != nil {
+        return nil, fmt.Errorf("error creating kafka consumer: %v", err)
+    }
+
     // Initialize bulk indexer
     bi, err := esutil.NewBulkIndexer(esutil.BulkIndexerConfig{
         Client:        es,
-        FlushBytes:    5e+6,  // 5MB
+        FlushBytes:    5e+6,
         FlushInterval: config.BatchTimeout,
         NumWorkers:    2,
-        // Add retry options for bulk operations
         RetryOnStatus: []int{502, 503, 504, 429},
         RetryBackoff: func(attempt int) time.Duration {
             return time.Duration(attempt) * 100 * time.Millisecond
@@ -126,26 +142,55 @@ func newConsumer(config *Config) (*Consumer, error) {
     }
 
     return &Consumer{
-        ready:    make(chan bool),
         messages: make(chan *Message, config.BatchSize),
         config:   config,
         es:       es,
         bi:       bi,
+        consumer: kc,
     }, nil
 }
 
-// ... (previous ConsumeClaim, Setup, and Cleanup methods remain the same)
+func (c *Consumer) consume(ctx context.Context) error {
+    err := c.consumer.SubscribeTopics(c.config.KafkaConfig.Topics, nil)
+    if err != nil {
+        return fmt.Errorf("error subscribing to topics: %v", err)
+    }
+
+    for {
+        select {
+        case <-ctx.Done():
+            return nil
+        default:
+            ev := c.consumer.Poll(100)
+            if ev == nil {
+                continue
+            }
+
+            switch e := ev.(type) {
+            case *kafka.Message:
+                c.messages <- &Message{
+                    Topic:     *e.TopicPartition.Topic,
+                    Payload:   string(e.Value),
+                    Timestamp: e.Timestamp,
+                }
+            case kafka.Error:
+                log.Printf("Error: %v: %v\n", e.Code(), e)
+                if e.Code() == kafka.ErrAllBrokersDown {
+                    return fmt.Errorf("all brokers are down")
+                }
+            }
+        }
+    }
+}
 
 func (c *Consumer) processBatch(ctx context.Context) {
     for msg := range c.messages {
-        // Create the indexing operation
-        indexName := msg.Topic // Use topic name as index name
-        
-        // Add retry mechanism for individual document indexing
+        indexName := msg.Topic
+
         err := c.bi.Add(ctx, esutil.BulkIndexerItem{
-            Action:     "index",
-            Index:      indexName,
-            Body:       strings.NewReader(msg.Payload),
+            Action: "index",
+            Index:  indexName,
+            Body:   strings.NewReader(msg.Payload),
             OnSuccess: func(ctx context.Context, item esutil.BulkIndexerItem, res esutil.BulkIndexerResponseItem) {
                 log.Printf("Successfully indexed document to index %s", indexName)
             },
@@ -157,7 +202,7 @@ func (c *Consumer) processBatch(ctx context.Context) {
                 }
             },
         })
-        
+
         if err != nil {
             log.Printf("Failed to add item to bulk indexer: %s", err)
         }
@@ -166,14 +211,18 @@ func (c *Consumer) processBatch(ctx context.Context) {
 
 func main() {
     config := &Config{
-        KafkaBrokers: []string{"localhost:9092"},
-        KafkaTopics:  []string{"topic1", "topic2", "topic3"},
+        KafkaConfig: KafkaConfig{
+            BootstrapServers: "localhost:9092",
+            Topics:           []string{"topic1", "topic2", "topic3"},
+            GroupID:         "elasticsearch-consumer",
+            AutoOffsetReset: "earliest",
+        },
         ElasticsearchConfig: ElasticsearchConfig{
             Addresses:     []string{"https://elasticsearch:9200"},
             Username:      "elastic",
             Password:      "your-password",
-            CACert:       "/path/to/ca.crt",  // Path to CA certificate if needed
-            SkipTLSVerify: false,             // Set to true to skip certificate verification (not recommended for production)
+            CACert:       "/path/to/ca.crt",
+            SkipTLSVerify: false,
             EnableRetry:   true,
             MaxRetries:    3,
             RetryTimeout:  time.Second * 30,
@@ -182,16 +231,43 @@ func main() {
         BatchTimeout: time.Second * 5,
     }
 
-    // Initialize Sarama config
-    saramaConfig := sarama.NewConfig()
-    saramaConfig.Consumer.Group.Rebalance.Strategy = sarama.BalanceStrategyRoundRobin
-    saramaConfig.Consumer.Offsets.Initial = sarama.OffsetOldest
-
     // Create consumer
     consumer, err := newConsumer(config)
     if err != nil {
         log.Fatalf("Error creating consumer: %v", err)
     }
+    defer consumer.consumer.Close()
+    defer consumer.bi.Close(context.Background())
 
-    // ... (rest of the main function remains the same)
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+
+    // Handle graceful shutdown
+    sigChan := make(chan os.Signal, 1)
+    signal.Notify(sigChan, os.Interrupt)
+
+    var wg sync.WaitGroup
+
+    // Start processing messages
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        consumer.processBatch(ctx)
+    }()
+
+    // Start consuming messages
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        if err := consumer.consume(ctx); err != nil {
+            log.Printf("Error consuming messages: %v", err)
+            cancel()
+        }
+    }()
+
+    // Wait for interrupt signal
+    <-sigChan
+    log.Println("Received interrupt signal, shutting down...")
+    cancel()
+    wg.Wait()
 }
