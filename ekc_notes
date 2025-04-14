@@ -1,0 +1,12 @@
+mkdir certs && cd certs
+openssl req -x509 -nodes -newkey rsa:2048 -keyout key.key -out cert.crt -days 365 -subj "/CN=elasticsearch"
+openssl pkcs12 -export -in cert.crt -inkey key.key -out elastic-certificates.p12 -passout pass:
+
+kubectl create secret generic elasticsearch-certs \
+  --from-file=elastic-certificates.p12=elastic-certificates.p12 \
+  -n elastic-stack
+
+
+kubectl create secret generic elasticsearch-credentials \
+  --from-literal=password=changeme \
+  -n elastic-stack
