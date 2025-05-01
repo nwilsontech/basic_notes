@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: python3-vm
+  labels:
+    app: python3
+spec:
+  containers:
+  - name: python3-container
+    image: python:3.11
+    command: ["sleep", "infinity"]
+    tty: true
+    stdin: true
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "250m"
+      limits:
+        memory: "512Mi"
+        cpu: "500m"
