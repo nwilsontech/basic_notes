@@ -1,126 +1,52 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: elastic-stack
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: elasticsearch-data
-  namespace: elastic-stack
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 5Gi
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: elasticsearch
-  namespace: elastic-stack
-spec:
-  selector:
-    app: elasticsearch
-  ports:
-    - name: http
-      port: 9200
-      targetPort: 9200
-    - name: transport
-      port: 9300
-      targetPort: 9300
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: elasticsearch
-  namespace: elastic-stack
-spec:
-  serviceName: "elasticsearch"
-  replicas: 1
-  selector:
-    matchLabels:
-      app: elasticsearch
-  template:
-    metadata:
-      labels:
-        app: elasticsearch
-    spec:
-      containers:
-        - name: elasticsearch
-          image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
-          ports:
-            - containerPort: 9200
-            - containerPort: 9300
-          env:
-            - name: discovery.type
-              value: "single-node"
-            - name: xpack.security.enabled
-              value: "true"
-            - name: xpack.security.http.ssl.enabled
-              value: "true"
-            - name: xpack.security.transport.ssl.enabled
-              value: "true"
-            - name: xpack.security.http.ssl.keystore.path
-              value: "certs/elastic-certificates.p12"
-            - name: xpack.security.http.ssl.truststore.path
-              value: "certs/elastic-certificates.p12"
-          volumeMounts:
-            - name: es-data
-              mountPath: /usr/share/elasticsearch/data
-            - name: certs
-              mountPath: /usr/share/elasticsearch/config/certs
-              readOnly: true
-      volumes:
-        - name: es-data
-          persistentVolumeClaim:
-            claimName: elasticsearch-data
-        - name: certs
-          secret:
-            secretName: elasticsearch-certs
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: kibana
-  namespace: elastic-stack
-spec:
-  selector:
-    app: kibana
-  ports:
-    - port: 5601
-      targetPort: 5601
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: kibana
-  namespace: elastic-stack
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: kibana
-  template:
-    metadata:
-      labels:
-        app: kibana
-    spec:
-      containers:
-        - name: kibana
-          image: docker.elastic.co/kibana/kibana:8.12.0
-          ports:
-            - containerPort: 5601
-          env:
-            - name: ELASTICSEARCH_HOSTS
-              value: "https://elasticsearch:9200"
-            - name: ELASTICSEARCH_USERNAME
-              value: "elastic"
-            - name: ELASTICSEARCH_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: elasticsearch-credentials
-                  key: password
-            - name: SERVER_SSL_ENABLED
-              value: "false"
+#!/bin/bash
+
+set -e
+
+# ==== CONFIGURATION ====
+EXTERNAL_IP=$(curl -s https://api.ipify.org)   # or set manually: EXTERNAL_IP="1.2.3.4"
+K3S_VERSION="v1.29.4+k3s1"
+RANCHER_VERSION="v2.8.2"
+RANCHER_NAMESPACE="cattle-system"
+INSTALL_K3S_EXEC="--tls-san $EXTERNAL_IP --disable traefik"
+
+echo "[+] Installing K3s with external access on IP: $EXTERNAL_IP"
+
+# ==== INSTALL K3S ====
+curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="$INSTALL_K3S_EXEC" INSTALL_K3S_VERSION=$K3S_VERSION sh -
+
+# Wait for K3s to be ready
+echo "[+] Waiting for K3s node to be ready..."
+sleep 10
+kubectl wait --for=condition=Ready nodes --timeout=90s
+
+# ==== INSTALL CERT-MANAGER ====
+echo "[+] Installing cert-manager..."
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.4/cert-manager.yaml
+kubectl wait --namespace cert-manager --for=condition=Available deployment/cert-manager-webhook --timeout=120s
+
+# ==== INSTALL RANCHER ====
+echo "[+] Creating namespace for Rancher..."
+kubectl create namespace $RANCHER_NAMESPACE || true
+
+echo "[+] Adding Rancher Helm repo..."
+helm repo add rancher-latest https://releases.rancher.com/server-charts/latest
+helm repo update
+
+echo "[+] Installing Rancher via Helm..."
+helm install rancher rancher-latest/rancher \
+  --namespace $RANCHER_NAMESPACE \
+  --set hostname="$EXTERNAL_IP" \
+  --set replicas=1 \
+  --set ingress.tls.source=auto \
+  --version $RANCHER_VERSION
+
+echo "[+] Waiting for Rancher deployment..."
+kubectl -n $RANCHER_NAMESPACE rollout status deploy/rancher --timeout=180s
+
+# ==== GET ACCESS ====
+echo "[+] Rancher installed successfully!"
+echo "========================================="
+echo "Access Rancher at: https://$EXTERNAL_IP"
+echo "Initial admin password:"
+kubectl get secret -n $RANCHER_NAMESPACE bootstrap-secret -o jsonpath="{.data.bootstrapPassword}" | base64 -d; echo
+echo "========================================="
